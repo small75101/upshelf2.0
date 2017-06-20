@@ -1,0 +1,35 @@
+K 25
+svn:wc:ra_dav:version-url
+V 66
+/svn/2015/!svn/ver/108/Portal5.0/upshelf/src/java/com/avit/upshelf
+END
+DBConnect.java
+K 25
+svn:wc:ra_dav:version-url
+V 80
+/svn/2015/!svn/ver/94/Portal5.0/upshelf/src/java/com/avit/upshelf/DBConnect.java
+END
+AutoThread.java
+K 25
+svn:wc:ra_dav:version-url
+V 82
+/svn/2015/!svn/ver/107/Portal5.0/upshelf/src/java/com/avit/upshelf/AutoThread.java
+END
+UpshelfService.java
+K 25
+svn:wc:ra_dav:version-url
+V 86
+/svn/2015/!svn/ver/108/Portal5.0/upshelf/src/java/com/avit/upshelf/UpshelfService.java
+END
+AutoAllThread.java
+K 25
+svn:wc:ra_dav:version-url
+V 84
+/svn/2015/!svn/ver/94/Portal5.0/upshelf/src/java/com/avit/upshelf/AutoAllThread.java
+END
+UpshelfThread.java
+K 25
+svn:wc:ra_dav:version-url
+V 84
+/svn/2015/!svn/ver/94/Portal5.0/upshelf/src/java/com/avit/upshelf/UpshelfThread.java
+END

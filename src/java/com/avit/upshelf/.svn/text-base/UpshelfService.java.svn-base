@@ -1,0 +1,454 @@
+package com.avit.upshelf;
+
+import java.io.IOException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+
+import net.sf.json.JSONArray;
+import net.sf.json.JSONObject;
+
+import org.apache.commons.lang.StringUtils;
+
+import com.avit.getDate.Constant;
+import com.avit.getDate.GetJson;
+import com.avit.upshelf.bean.AutoAction;
+import com.avit.upshelf.bean.Category;
+import com.avit.util.InitConfig;
+
+/**
+ * 自动上架执行类
+ * @author mengjt
+ *
+ */
+public class UpshelfService {
+	
+	long productOrder = 0;//上架节点序号
+	String productId  = "";//所属产品ID(productOfferingID)
+	String parentIds = "";//上级节点ID串(*/*/*)
+	String resourcePath = "";//resource_id串(*/*/*)
+	String resourceShowPath = "";//resource_name串(*/*/*)
+	String operationCode;//运营商编码
+	Long rootId;//树根节点ID
+	
+	private List<Category> categoryList = null;//获取的节点列表
+	private Map<Long,Category> delCateIdMap = null;//一级分类(不包括一级分类)下所有节点的Map<id,obj>
+	
+	GetJson getJson = new GetJson();
+	DBConnect jdbc = null;
+	StringBuffer log = null;
+	
+	public UpshelfService(){
+
+	}
+	
+	public void init(DBConnect jdbc, String operationCode) {
+		this.jdbc = jdbc;
+		this.operationCode = operationCode;
+	}
+	
+	/**
+	 * 
+	 * @param url 数据访问URL
+	 * @param cateId 一级分类ID
+	 * @param hotNewsId 热点新闻ID
+	 * @throws Exception
+	 */
+	public void dataUpshelf(String url,Long cateId) throws Exception{
+		long startTime = System.currentTimeMillis();
+		log = new StringBuffer();
+		categoryList = new ArrayList<Category>();
+		try{	
+			AutoAction auto = jdbc.getAutoActionByMenuId(cateId);
+			//检查可上架标识
+			if(auto != null && auto.getUptreeFlag() == 1){
+				if(StringUtils.isEmpty(url)){
+					url = InitConfig.getConfigMap().get("bo_addr")+auto.getRsyncUrl();
+				}
+				//锁定上架  
+				//* 根据菜单ID修改上架标识（0-不允许上架，1-允许上架，2-正在上架）
+				//* update t_autoaction set uptree_flag=? where menuid=?
+				jdbc.updateUpTreeByMenuId(2, cateId);
+			}else{
+				System.out.println("can't do autoUpTree ,pls reconfig t_autoAction table");
+				return;
+			}
+			
+			Category poCate = new Category();
+			poCate.setId(cateId);
+			poCate = jdbc.getCategory(poCate);
+			if (poCate == null) {
+				System.out.println("please create the po category first!");
+				return;
+			}
+			parentIds = String.valueOf(cateId);
+			resourcePath = poCate.getResourcePath();
+			resourceShowPath = poCate.getResourceShowPath();
+			
+			//初始数据库节点列表
+			delCateIdMap = jdbc.getSubCateIdMap(cateId);
+			//根据运营商获取相应树的根节点ID
+			rootId = jdbc.getRootId(operationCode);
+			
+			log.append("\n"+operationCode+">>>>上架产品   id="+cateId+" name="+poCate.getResourceName());
+			
+			//解析数据  获取并解析bo数据 到categoryList
+			parseVodJson(url);
+
+			//上架
+			upShelf(cateId);
+			
+			log.append("\n    用时=").append((System.currentTimeMillis()-startTime)/1000).append("s");
+			System.out.println(
+					"["+new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())+"] " +
+					log.toString());
+		} catch(Exception e) {
+			throw e;
+		} finally {
+			//释放上架锁
+			jdbc.updateUpTreeByMenuId(1, cateId);
+			log = null;
+			categoryList = null;
+			delCateIdMap = null;
+		}
+	}
+	
+	/**
+	 * 递归解析Json数据
+	 * @param url
+	 * @throws IOException
+	 */
+	public void parseVodJson(String url) throws IOException{
+			
+		String jsonData = getJson.getJson(url);
+		int  retrytimes=5;
+		while("TIMEOUT".equals(jsonData) && retrytimes>=0){
+			try {
+				Thread.sleep(2000);
+			} catch (InterruptedException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}
+			retrytimes--;
+			jsonData = getJson.getJson(url);
+		}
+		if("TIMEOUT".equals(jsonData)) {
+			throw new IOException( jsonData.toString() + "******=>  getJson.getJson="+url);
+		}
+		
+		JSONObject jsonObj = JSONObject.fromObject(jsonData);
+		JSONObject areaObj= null;
+		if (jsonObj.containsKey("DataArea")) {
+	//		log.append("\njson data ok****==》"+url );
+			areaObj = jsonObj.getJSONObject("DataArea");
+		}
+		if (areaObj != null) {
+			String key = "";
+			if (areaObj.containsKey("ListOfSubEntry")) {
+				key = "ListOfSubEntry";
+			} else if (areaObj.containsKey("ListOfEntry")) {
+				key = "ListOfEntry";
+			}
+			if (!key.equals("")) {
+				JSONArray entryArray = areaObj.getJSONArray(key);
+				int entrySize = entryArray.size();
+				for (int i = 0; i < entrySize; i++) {
+					JSONObject obj = entryArray.getJSONObject(i);
+					String tagName = obj.getString("tagName");
+		
+					if (Constant.PRODUCTOFFERING.equals(tagName)) {//一级分类
+						productId = obj.getJSONObject("tagAttribute").getString("productOfferingID");
+						setCategory(obj, Constant.CATEGORY_TYPE_CATE);
+						parseSub(obj,url);
+						setParam();
+					} else if (Constant.VIEW.equals(tagName)) {
+						parseSub(obj,url);
+					} else if (Constant.FOLDER.equals(tagName)) {//下级分类
+						setCategory(obj, Constant.CATEGORY_TYPE_CATE);
+						parseSub(obj,url);
+						setParam();
+					} else if (Constant.BUNDLE.equals(tagName)) {//资源包
+						setCategory(obj, Constant.CATEGORY_TYPE_ASSETP);
+						setParam();
+					} else if (Constant.ASSET.equals(tagName)) {//资源
+						setCategory(obj, Constant.CATEGORY_TYPE_ASSET);
+						setParam();
+					} else if (Constant.SPACE.equals(tagName)) {
+						parseSub(obj,url);
+					} else if (Constant.SYMBOLLINK.equals(tagName)) {//链接
+						setCategory(obj, Constant.CATEGORY_TYPE_LINK);
+						setParam();
+					} 
+				}
+			}else{
+				log.append("\njson data fail****==>" +url+"\n"+ jsonData+"\n");
+				throw new IOException(areaObj.toString() + " parseVodJson="+url);
+			}
+		}
+	}
+	
+	/**
+	 * 解析下层数据
+	 * @param entryObj
+	 * @param url
+	 * @throws IOException
+	 */
+	private void parseSub(JSONObject entryObj,String url) throws IOException{
+		String parentHUID ="";
+		JSONObject attObj = entryObj.getJSONObject("tagAttribute");
+
+		parentHUID = attObj.getString("parentHUID");
+		String currentHUID = attObj.getString("hierarchyUID");
+		String jsonUrl = "";
+		jsonUrl = url.replaceAll(parentHUID,currentHUID);
+		parseVodJson(jsonUrl);
+	}
+	
+	/**
+	 * 上架
+	 * @param cateId 一级分类ID
+	 */
+	private void upShelf(Long cateId){
+		Collections.sort(categoryList);
+//		long order = 1;
+//		for(Category cate : categoryList){
+//			cate.setResourceOrder(order++);
+//		}
+		compareCategory(cateId);
+		//删除分类
+		jdbc.delCategory(delCateIdMap);
+		if(delCateIdMap.size() > 0){
+			log.append("\n    删除节点="+delCateIdMap.size());
+		}
+	}
+	
+	/**
+	 * 比较更新上架节点
+	 * @param cateId
+	 */
+	private void compareCategory(Long cateId){
+		
+		if(categoryList == null || categoryList.size()<=0){
+			return;
+		}
+		Map<Long,Long> orderMap = jdbc.getResourceOrderMap(cateId);
+		List<Category> updateCateList = new ArrayList<Category>();
+		List<Category> addCateList = new ArrayList<Category>();
+//		List<CategoryInfo> addCateInfoList = new ArrayList<CategoryInfo>();
+		
+		for(Category cate : categoryList){
+			if(cate.getType() == Constant.OPE_UPD_ORDER){
+				//只修改排序
+				if(cate.getResourceOrder() != null && orderMap.get(cate.getId()) != null){
+					if(cate.getResourceOrder().longValue() != orderMap.get(cate.getId()).longValue()){
+						updateCateList.add(cate);
+					}
+				}
+			}else if(cate.getType() == Constant.OPE_UPD){
+				updateCateList.add(cate);
+			}else if(cate.getType() == 2){
+				if(Constant.CATEGORY_TYPE_ASSET.equals(cate.getResourceType()) 
+						|| Constant.CATEGORY_TYPE_ASSETP.equals(cate.getResourceType())){
+					//新增资源、资源包
+					if(jdbc.hasAssetByAssetId(cate.getResourceId(), operationCode)){
+						addCateList.add(cate);
+					}else{
+						System.out.println("asset is not exist " + cate.getResourceId());
+					}
+				}else{
+					//新增分类
+					addCateList.add(cate);
+//					addCateInfoList.add(setCategorInfo(cate));
+				}
+			}
+		}
+
+		jdbc.updateCategory(updateCateList);
+		jdbc.addCategory(addCateList);
+//		jdbc.insertCategoryInfo(addCateInfoList);
+		if (addCateList.size() + updateCateList.size() > 0) {
+			jdbc.updateTreeState(1, rootId);
+		}
+		
+//		log.append("    新增分类="+addCateInfoList.size());
+		log.append("\n    新增节点="+addCateList.size());
+		log.append("\n    更新节点="+updateCateList.size());
+		
+		updateCateList = null;
+		addCateList = null;
+//		addCateInfoList = null;
+		orderMap = null;
+	}
+
+	/**
+	 * 获取媒资ID
+	 * @param attObj
+	 * @return
+	 */
+	private String getAssetId(JSONObject attObj) {
+		String hierarchyUID = "";
+		String localEntryUID = "";
+		if(attObj.containsKey("hierarchyUID")){
+			hierarchyUID = attObj.getString("hierarchyUID");
+		}
+		if(attObj.containsKey("localEntryUID")){
+			localEntryUID = attObj.getString("localEntryUID");
+		}
+		return hierarchyUID+"_"+localEntryUID;
+	}
+	
+	/**
+	 * 设置分类栏目信息
+	 * @param obj
+	 * @param resourceType
+	 */
+	private void setCategory(JSONObject obj, String resourceType){
+		Category newCategory = new Category();
+		Long parentId = 0L;
+		String resourceId = "";
+		String resourceName = "";
+		Long linkId = null;
+		
+		JSONObject attObj = obj.getJSONObject("tagAttribute");
+		if(Constant.CATEGORY_TYPE_ASSET.equals(resourceType) 
+				|| Constant.CATEGORY_TYPE_ASSETP.equals(resourceType)){
+			//资源或资源包信息
+			JSONArray metaArray = obj.getJSONArray("ListOfMetaData");
+			int metaSize = metaArray.size();
+			for (int n = 0; n < metaSize; n++) {
+				JSONObject metaObj = metaArray.getJSONObject(n);
+				if(metaObj.containsKey("Title")){
+					resourceName = metaObj.getString("Title");
+					break;
+				}
+			}
+			if(StringUtils.isEmpty(productId)){
+				if(attObj.containsKey("productOfferingUID")){
+					productId = attObj.getString("productOfferingUID");
+				}
+			}
+			resourceId = getAssetId(attObj);
+			newCategory.setProductId(productId);
+		}else{
+			resourceId = attObj.getString("hierarchyUID");
+			resourceName = attObj.getString("entryName");
+			//链接信息
+			if (Constant.CATEGORY_TYPE_LINK.equals(resourceType)) {
+				String targetHUID = attObj.getString("targetHUID");
+				linkId = jdbc.getLinkId(operationCode, targetHUID);
+			}
+		}
+		if(parentIds.indexOf("/")>0){
+			parentId = Long.valueOf(parentIds.substring(parentIds.lastIndexOf("/")+1,parentIds.length()));
+		}else{
+			parentId = Long.valueOf(parentIds);
+		}
+		if (StringUtils.isNotEmpty(resourceShowPath)) {
+			String tmp = resourceName.replaceAll("/","#");
+			resourceShowPath = resourceShowPath+"/"+tmp;
+		}
+		
+		newCategory.setResourceId(resourceId);
+		newCategory.setResourceName(resourceName);
+		newCategory.setResourceType(resourceType);
+		newCategory.setParentId(parentId);
+		newCategory.setResourceShowPath(resourceShowPath);
+		newCategory.setLinkId(linkId);
+		newCategory.setOperationCode(operationCode);
+		
+		//资源和资源包根据类型、父节点ID、资源ID、产品ID查询
+		//分类目录根据类型、父节点ID、资源显示路径查询
+		Category oldCategory = jdbc.getCategory(newCategory);
+		if(oldCategory == null){
+//			System.out.println("resourceType="+resourceType+",resourceId="+resourceId+",ParentId="+parentId+",productId="+productId+",resourceName="+resourceName);
+//			long id = jdbc.getCategorySeq(0);
+			//双数据库支持
+			long id = jdbc.getCategorySeqForAll();
+			parentIds = parentIds+"/"+ id;
+			if (StringUtils.isNotEmpty(resourcePath)) {
+				resourcePath = resourcePath+"/"+resourceId;
+			}
+			
+			newCategory.setId(id);
+			newCategory.setResourcePath(resourcePath);
+			newCategory.setResourceOrder(++productOrder);
+			newCategory.setType(Constant.OPE_ADD);//新增
+		
+//			long templateId = jdbc.getTemplateId(useParentId,resourceType);
+//			if(templateId == 0){
+//				if("1".equals(resourceType)){
+//					templateId = jdbc.getDefaultTempateIdByType("asset");
+//				}else if("2".equals(resourceType)){
+//					templateId = jdbc.getDefaultTempateIdByType("assetpackage");
+//				}else if("8".equals(resourceType)){
+//					templateId = jdbc.getDefaultTempateIdByType("category");
+//				}
+//			}
+//			cate.setTemplateId(templateId);
+			
+			categoryList.add(newCategory);
+		}else{
+			oldCategory.setResourceOrder(++productOrder);
+			if (!resourceName.equals(oldCategory.getResourceName())
+					|| (linkId != null && !linkId.equals(oldCategory.getLinkId()))) {
+				oldCategory.setType(Constant.OPE_UPD);//修改资源名称和链接ID
+				oldCategory.setResourceName(resourceName);
+				oldCategory.setResourceShowPath(resourceShowPath);
+				oldCategory.setLinkId(linkId);
+			} else {
+				oldCategory.setType(Constant.OPE_UPD_ORDER);//只修改排序
+			}
+			categoryList.add(oldCategory);
+			removeCategory(oldCategory.getId());			
+			parentIds = parentIds+"/"+oldCategory.getId();
+			if (StringUtils.isNotEmpty(resourcePath)) {
+				resourcePath = resourcePath+"/"+oldCategory.getResourceId();
+			}
+		}
+	}
+	
+	/**
+	 * 设置分类栏目信息
+	 * @param cate
+	 * @return CategoryInfo
+	 */
+//	private CategoryInfo setCategorInfo(Category cate) {
+//		CategoryInfo cateInfo = new CategoryInfo();
+//		long id = jdbc.getCategorySeq(1);
+//		cateInfo.setId(id);
+//		cateInfo.setCategoryId(cate.getId());
+//		cateInfo.setCategoryName(cate.getResourceName());
+//		cateInfo.setType(cate.getResourceType());
+//		cateInfo.setCategoryDesc(cate.getResourceName());
+//		return cateInfo;
+//	}
+	
+	/**
+	 * 从删除分类信息列表中减去需要删除的分类ID
+	 * @param categoryId
+	 */
+	private void removeCategory(Long categoryId){
+		if(delCateIdMap != null && delCateIdMap.size()>0){
+			delCateIdMap.remove(categoryId);
+		}	
+	}
+	
+	/**
+	 * 修改全局参数信息
+	 */
+	private void setParam(){
+		if(StringUtils.isNotEmpty(resourceShowPath) && resourceShowPath.indexOf("/")>0){
+			resourceShowPath = resourceShowPath.substring(0,resourceShowPath.lastIndexOf("/"));
+		}
+		if (StringUtils.isNotEmpty(resourcePath) && resourcePath.indexOf("/")>0){
+			resourcePath = resourcePath.substring(0,resourcePath.lastIndexOf("/"));
+		}
+		if(parentIds.indexOf("/")>0){
+			parentIds = parentIds.substring(0,parentIds.lastIndexOf("/"));
+		}
+	}
+
+}

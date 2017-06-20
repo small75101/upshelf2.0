@@ -1,0 +1,724 @@
+package com.avit.getDate;
+
+import java.io.IOException;
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.Iterator;
+
+import net.sf.json.JSONArray;
+import net.sf.json.JSONException;
+import net.sf.json.JSONObject;
+
+import org.apache.commons.lang.StringUtils;
+
+import com.avit.getDate.bean.AssetTransition;
+import com.avit.getDate.bean.ProductOffering;
+import com.avit.getDate.bean.RelaContPCont;
+import com.avit.util.StringUtil;
+
+public class BODateParse {
+
+	int all = 0;//0代表增量，1代表全量
+	int updateAssetNum = 0;//更新的资源数
+	String doPo_id = "0";//需要处理的产品ID(productOfferingID) 0表示全处理
+	String operationCode = "center";//运营商编码
+	
+	String productId = "";//当前产品ID(productOfferingID)
+	String productName = "";//当前产品名称(productOfferingName)
+	Integer productType = 0;//当前产品类型
+//	int po_asset_id = 0;//产品中资源序号，从1开始
+	String resourcePath = "";
+
+	//上一次同步的数据
+	private Map<String,ProductOffering> oldProductMap = new HashMap<String,ProductOffering>();
+	private Map<String,AssetTransition> oldAssetinfoMap = new HashMap<String,AssetTransition>();
+	//本次同步的产品数据
+//	private Map<String,ProductOffering> productMap = new HashMap<String,ProductOffering>();
+	private List<AssetTransition> updateAssetList = new ArrayList<AssetTransition>();
+	
+	//资源与资源包的关系列表、资源与产品的关系列表
+//	private List<RelaContPCont> tempPackageAssetList = new ArrayList<RelaContPCont>();
+//	private List<TempAssetProduct> tempAssetProductList = new ArrayList<TempAssetProduct>();
+	
+	private Map<String,List<RelaContPCont>> packageInfo = new HashMap<String,List<RelaContPCont>>();
+	
+	GetJson getJson = new GetJson();
+	RsyncResourceData rsync = null;
+	StringBuffer log = null;
+	
+	public BODateParse(){
+		
+	}
+	public void init(Connection con)throws SQLException{
+		rsync = new RsyncResourceData(con);
+	}
+	
+	/**
+	 * 数据同步
+	 * @param url 数据访问URL
+	 * @param flag 0代表增量，1代表全量
+	 * @param po_id 需要处理的产品ID(productOfferingID) 0表示全处理
+	 * @param operationCode 运营商编码
+	 * @throws IOException
+	 */
+	public void dataRsync(String url,int flag,String po_id, String operationCode) throws IOException{
+		Date date = new Date();
+		log = new StringBuffer();
+		
+		this.all = flag;
+		if (StringUtil.isNotEmpty(po_id)) {
+			this.doPo_id = po_id;
+		}
+		if (StringUtil.isNotEmpty(operationCode)) {
+			this.operationCode = operationCode;
+		}
+		
+		//解析数据
+		System.out.println("-------开始同步---解析BO数据url为:"+url);
+		parseVodJson(url);
+		System.out.println("-------同步解析BO数据结束");
+		//删除本次同步数据中未含有的产品
+//		rsyncProduct();
+		if (updateAssetList.size() > 0) {
+			rsync.updateTreeState(1, this.operationCode);
+		}
+
+		if(log.length() > 0){
+			log.append("\n    用时=").append((new Date().getTime() - date.getTime())/1000).append("s");
+			log.append("\n    缓存资源数="+oldAssetinfoMap.size());
+			System.out.println(
+					"["+new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())+"] " +
+					log.toString());
+		}
+		log = null;
+	}
+	
+	/**
+	 * 递归解析Json数据
+	 * @param url
+	 * @throws IOException
+	 */
+	public void parseVodJson(String url) throws IOException{
+		
+	
+	//	System.out.println("同步函数----BODateParse中解析-----");
+		String jsonData= getJson.getJson(url);
+		
+		int  retrytimes=5;
+		while("TIMEOUT".equals(jsonData) && retrytimes>=0){
+			try {
+				Thread.sleep(2000);
+			} catch (InterruptedException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}
+			retrytimes--;
+			jsonData = getJson.getJson(url);
+		}
+		if("TIMEOUT".equals(jsonData)) {
+			throw new IOException( jsonData.toString() + "******=>  getJson.getJson="+url);
+		}
+		
+		JSONObject jsonObj = JSONObject.fromObject(jsonData);
+		JSONObject areaObj= null;
+		if (jsonObj.containsKey("DataArea")) {
+		//	log.append("\njson data ok****==》"+url );
+			areaObj = jsonObj.getJSONObject("DataArea");
+		}
+		if (areaObj != null) {
+			String key = "";
+			if (areaObj.containsKey("ListOfSubEntry")) {
+				key = "ListOfSubEntry";
+			} else if (areaObj.containsKey("ListOfEntry")) {
+				key = "ListOfEntry";
+			}
+			if (!key.equals("")) {
+				JSONArray entryArray = areaObj.getJSONArray(key);
+				int entrySize = entryArray.size();
+//				if(entrySize==0){
+//					throw new IOException("***数据为空***"+areaObj.toString() + " parseVodJson="+url);
+//				}
+			
+				for (int i = 0; i < entrySize; i++) {
+					JSONObject entryObj = entryArray.getJSONObject(i);
+					String tagName = entryObj.getString("tagName");
+					 
+					if (Constant.PRODUCTOFFERING.equals(tagName)) {//产品
+						productId = entryObj.getJSONObject("tagAttribute").getString("productOfferingID");
+						if(doPo_id.equals("0") || doPo_id.equals(productId)){
+							try {
+								updateAssetNum = 0;
+								//初始化资源同步Map
+								oldAssetinfoMap = rsync.initMap(productId, operationCode);
+								//解析产品
+								parsePOJson(entryObj);
+								log.append("\n"+operationCode+">>>>同步产品   poid="+productId+" name="+productName);
+								setPath(productName);
+								//解析产品下层数据
+								parseSub(entryObj,url) ;
+								//更新产品相关资源
+								rsyncAsset();
+							} catch (SQLException e) {
+								e.printStackTrace();
+							}
+							//清空资源包关系列表、产品资源关系列表
+							//tempPackageAssetList.clear();
+							packageInfo.clear();
+//							tempAssetProductList.clear();
+						}
+						
+					} else if (Constant.VIEW.equals(tagName)) {	
+						parseSub(entryObj,url) ;
+					} else if (Constant.FOLDER.equals(tagName)) {
+						setPath(entryObj.getJSONObject("tagAttribute").getString("entryName"));
+						parseSub(entryObj,url);
+					} else if (Constant.BUNDLE.equals(tagName)) {//资源包
+						parseBundleJson(entryObj);
+					} else if (Constant.ASSET.equals(tagName)) {//资源
+						parseAssetJson(entryObj, null,1);
+					} else if (Constant.SPACE.equals(tagName)) {
+						parseSub(entryObj,url) ;
+					}
+				}
+				
+			}else{
+				log.append("\njson data fail****==>" +url+"\n"+ jsonData+"\n");
+				throw new IOException(areaObj.toString() + " parseVodJson="+url);
+			}
+		}
+		setPath(null);
+		
+
+	}
+
+	/**
+	 * 同步资源、资源包（根据产品ID）
+	 */
+	private void rsyncAsset() {
+		Iterator<String> set = null;
+		int oldNum = oldAssetinfoMap.size();
+		try {
+			long time1 = System.currentTimeMillis();
+			Set<String> isUsedAssets = rsync.isUseByOtherPackageAssets(productId);
+			//更新资源
+			long time2 = System.currentTimeMillis();
+			rsync.tranStart();
+			//更新资源
+			rsync.updateAssetinfo(updateAssetList);
+			
+			//更新连续剧关系
+			set = packageInfo.keySet().iterator();
+			while(set.hasNext()){
+				String packageId = set.next();
+				updateAssetPackage(packageInfo.get(packageId), packageId);
+			}
+			
+			long time3 = System.currentTimeMillis();
+			set = rsync.getDelAssetMap().keySet().iterator();
+			while (set.hasNext()) {
+				String tmp_id = set.next();
+				try {
+					if (!isUsedAssets.contains(tmp_id)) {
+						rsync.deleteAssetinfo(productId, tmp_id);
+						oldAssetinfoMap.remove(tmp_id);
+					}
+				} catch (Exception e) {
+					e.printStackTrace();
+				}
+			}
+			long time4 = System.currentTimeMillis();
+			rsync.tranCommit();
+			System.out.println("rsyncAsset poId="+productId+" sql="+(time2-time1)+" update="+(time3-time2)+" del="+(time4-time3)+" total="+(System.currentTimeMillis()-time1));
+		} catch (Exception e) {
+			e.printStackTrace();
+			try {
+				rsync.tranRollback();
+			} catch (SQLException e1) {
+			}
+		} finally {
+			set = null;
+		}
+
+//		log.append("    同步资源数=" + po_asset_id).append("\n");
+		log.append("\n    更新资源数=" + updateAssetList.size());
+		log.append("\n    删除资源数=" + (oldNum - oldAssetinfoMap.size()));
+	
+	}
+
+	/**
+	 * 解析产品
+	 * @param entryObj
+	 */
+	private void parsePOJson(JSONObject entryObj) {
+		// 初始化产品中资源的序号
+//		po_asset_id = 0;
+		// 清空产品资源关系列表
+//		tempAssetProductList.clear();
+		// 设置产品信息
+		ProductOffering product = setProducOffering(entryObj);
+		product.setOpCode(operationCode);
+//		productId = product.getProductOfferingCode();
+		productName = product.getProductOfferingName();
+		productType = product.getChargeType();
+
+		if (all != 0)
+			updatePro(product);
+		else {
+			if (oldProductMap.containsKey(product.getProductOfferingCode())) {
+				if (!oldProductMap.get(product.getProductOfferingCode()).compareTo(
+						product)) {
+					updatePro(product);
+				}
+			} else
+				updatePro(product);
+		}
+//		productMap.put(product.getProductOfferingCode(), product);
+	}
+
+	/**
+	 * 更新产品
+	 * @param product
+	 */
+	private void updatePro(ProductOffering product) {
+		try {
+//			long product_id =
+				rsync.updateProductOffering(product);
+//			if (product_id > 0) {
+				oldProductMap.put(product.getProductOfferingCode(), product);
+//			}
+		} catch (SQLException e) {
+			e.printStackTrace();
+		}
+	}
+
+	/**
+	 * 设置资源、资源包信息
+	 * @param type 0资源，1资源包
+	 * @param entryObj
+	 * @return
+	 */
+	private AssetTransition setAssetOrBundle(int type, JSONObject entryObj,int resourceType) {
+		AssetTransition assetinfo = new AssetTransition();
+		// 获取媒资ID
+		String assetId = getAssetId(entryObj);
+		assetinfo.setAssetId(assetId);
+//		assetinfo.setKeyword(productName);
+		assetinfo.setChargeType(productType);
+		assetinfo.setState(Constant.ASSET_STATE_NORMAL);
+		if (type == 1) {
+			assetinfo.setContentPackageCode(assetinfo.getAssetId());
+		} else {
+			assetinfo.setContentCode(assetinfo.getAssetId());
+		}
+		if (productType == Constant.CHARGE_TYPE_BAOYUE) {
+			assetinfo.setProductType(Constant.PRODUCT_TYPE_BAOYUE);
+		} else {
+			if (type == 1) {
+				assetinfo.setProductType(Constant.PRODUCT_TYPE_ANCI_P);
+			} else {
+				assetinfo.setProductType(Constant.PRODUCT_TYPE_ANCI_C);
+			}
+		}
+//		assetinfo.setCategory(resourcePath);
+		assetinfo.setContentOrder(++updateAssetNum);
+		//assetinfo.setContentType(Constant.PAC_ASSET_TYPE);
+		//1为电影，2为连续剧，3为连续剧下影片
+		assetinfo.setContentType(resourceType);
+		assetinfo.setOperationCode(operationCode);
+		setAsset(entryObj, assetinfo);
+		return assetinfo;
+	}
+	
+	/**
+	 * 解析资源包
+	 * @param entryObj
+	 */
+	private void parseBundleJson(JSONObject entryObj) throws IOException {
+		// 清空资源包关系列表
+		List<RelaContPCont> tempPackageAssetList = new ArrayList<RelaContPCont>();
+		//tempPackageAssetList.clear();
+		// 设置资源包信息
+		AssetTransition bundleinfo = setAssetOrBundle(1, entryObj,3);
+
+		// 从资源删除列表中移除本次同步的资源包
+		removeDelAssetMap(bundleinfo.getAssetId());
+		
+		String localEntryUID = "";
+		String hierarchyUID = "";
+		JSONObject attObj = entryObj.getJSONObject("tagAttribute");
+		if (attObj.containsKey("localEntryUID")) {
+			localEntryUID = attObj.getString("localEntryUID");
+		}
+		if (attObj.containsKey("hierarchyUID")) {
+			hierarchyUID = attObj.getString("hierarchyUID");
+		}
+
+//		try {
+			//System.out.println(resourcePath + "/(资源包)"+bundleinfo.getAssetName());
+			String bundleJson = getJson.getBundleJson(localEntryUID,
+					hierarchyUID);
+			
+			int  retrytimes=5;
+			while("TIMEOUT".equals(bundleJson) && retrytimes>=0){
+				try {
+					Thread.sleep(2000);
+				} catch (InterruptedException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}
+				retrytimes--;
+				bundleJson = getJson.getBundleJson(localEntryUID,hierarchyUID);
+			}
+			if("TIMEOUT".equals(bundleJson)) {
+				throw new IOException( bundleJson.toString() + "******=>  parseBundleJson="+localEntryUID);
+			}
+			
+			
+			JSONObject jsonObj = JSONObject.fromObject(bundleJson);
+
+			// 获取DataArea区域的Json对象
+			JSONObject bundleAreaObj = jsonObj.getJSONObject("DataArea");
+
+			if (bundleAreaObj.containsKey("ListOfEntry")) {
+				JSONArray array = bundleAreaObj.getJSONArray("ListOfEntry");
+				JSONObject tmpAssetObj = null;
+				AssetTransition firstAsset = null;
+				for (int i = 0; i < array.size(); i++) {
+					tmpAssetObj = array.getJSONObject(i);
+					// 解析资源
+					AssetTransition assetinfo = parseAssetJson(tmpAssetObj, bundleinfo.getAssetId(),3);
+					// 添加资源包与资源关系
+					RelaContPCont tpa = new RelaContPCont();
+					tpa.setContentPackageCode(bundleinfo.getAssetId());
+					tpa.setContentCode(assetinfo.getAssetId());
+					tpa.setContentType(Constant.PAC_ASSET_TYPE);
+					tpa.setRelaOrder(i + 1);
+					tpa.setOperationCode(operationCode);
+					tempPackageAssetList.add(tpa);
+
+					if (firstAsset == null) {
+						firstAsset = assetinfo;
+					}
+				}
+				if (firstAsset != null) {
+					// 修改bundle数据中主演、导演、海报、描述信息
+					modifyBundleinfo(bundleinfo, firstAsset);
+				}
+			}else{
+				throw new IOException(bundleAreaObj.toString()+" parseBundleJson error assetPackage="+bundleinfo.getAssetId());
+			}
+			
+			//比较资源并更新
+			updateByCompare(bundleinfo);
+			// 添加产品与资源关系
+//			addProductAsset(bundleinfo.getAssetId());
+			// 更新资源包与资源的关系
+			packageInfo.put(bundleinfo.getAssetId(), tempPackageAssetList);		
+
+//		} catch (IOException e) {
+//			System.out.println("parseBundleJson error assetPackage="+bundleinfo.getAssetId());
+//			e.printStackTrace();
+//		}
+
+	}
+	
+	/**
+	 * 更新资源、资源包
+	 * @param obj
+	 * @return
+	 */
+	private boolean updateAsset(AssetTransition obj) {
+		boolean result = false;
+		try {
+//			rsync.updateAssetinfo(obj);
+			oldAssetinfoMap.put(obj.getAssetId(), obj);
+			updateAssetList.add(obj);
+//			updateAssetNum++;
+			result = true;
+//		} catch (SQLException e) {
+		} catch (Exception e) {
+			System.out.println("updateAsset error asset="+obj.getAssetId());
+			e.printStackTrace();
+		}
+		return result;
+	}
+	
+	/**
+	 * 从资源删除列表中移除不需要删除的资源
+	 * @param asset
+	 */
+	private void removeDelAssetMap(String assetId){;
+		rsync.getDelAssetMap().remove(assetId);
+//		rsync.getDelAssetBackMap().remove(assetId);	
+	}
+	/**
+	 * 更新资源包与资源的关系
+	 * @param list
+	 * @param assetId
+	 * @throws SQLException
+	 */
+	private void updateAssetPackage(List<RelaContPCont> list, String assetId) {
+		try {
+			rsync.updatePackageAsset(list, assetId);
+		} catch (SQLException e) {
+			System.out.println("updateAssetPackage error assetPackage="+assetId);
+			e.printStackTrace();
+		}
+	}
+	
+	/**
+	 * 解析资源
+	 * @param entryObj
+	 * @return
+	 */
+	private AssetTransition parseAssetJson(JSONObject entryObj, String parentId,int resourceType) {
+		AssetTransition assetinfo = setAssetOrBundle(0, entryObj,resourceType);
+		if (parentId != null) {
+			assetinfo.setContentPackageCode(parentId);
+			assetinfo.setParentAssetId(parentId);
+		}
+		// 从资源删除列表中移除本次同步的资源
+		removeDelAssetMap(assetinfo.getAssetId());
+		//比较资源并更新
+		updateByCompare(assetinfo);
+		// 添加产品与资源关系
+//		addProductAsset(assetinfo.getAssetId());
+		
+		return assetinfo;
+	}
+	
+	/**
+	 * 同旧资源作比较更新
+	 * @param assetinfo
+	 */
+	private void updateByCompare(AssetTransition assetinfo) {
+		if (all == 0) {//增量更新
+			if (oldAssetinfoMap.containsKey(assetinfo.getAssetId())) {//修改
+				if (!oldAssetinfoMap.get(assetinfo.getAssetId()).compareTo(assetinfo)) {
+					updateAsset(assetinfo);
+				}
+			} else {//新增
+				updateAsset(assetinfo);
+			}
+		} else {//全量更新
+			updateAsset(assetinfo);
+		}
+	}
+	
+	/**
+	 * 取资源信息填充到资源包中
+	 * @param bundleObj
+	 * @param assetinfo
+	 */
+	private void modifyBundleinfo(AssetTransition bundletinfo, AssetTransition firstAsset) {
+
+		// 判断bundle数据中是否存在主演、导演、海报、描述
+		if (StringUtils.isEmpty(bundletinfo.getActor())) {
+			bundletinfo.setActor(firstAsset.getActor());
+		}
+		if (StringUtils.isEmpty(bundletinfo.getDirector())) {
+			bundletinfo.setDirector(firstAsset.getDirector());
+		}
+		if (StringUtils.isEmpty(bundletinfo.getPosterUrl())) {
+			bundletinfo.setPosterUrl(firstAsset.getPosterUrl());
+		}
+		if (StringUtils.isEmpty(bundletinfo.getAssetDesc())) {
+			bundletinfo.setAssetDesc(firstAsset.getAssetDesc());
+		}
+	}
+	
+	/**
+	 * 获取媒资ID
+	 * 
+	 * @param attObj
+	 * @return
+	 */
+	private String getAssetId(JSONObject assetObj) {
+		String hierarchyUID = "";
+		String localEntryUID = "";
+		if (assetObj.containsKey("tagAttribute")) {
+			JSONObject attObj = assetObj.getJSONObject("tagAttribute");
+			if (attObj.containsKey("hierarchyUID")) {
+				hierarchyUID = attObj.getString("hierarchyUID");
+			}
+			if (attObj.containsKey("localEntryUID")) {
+				localEntryUID = attObj.getString("localEntryUID");
+			}
+		}
+		return hierarchyUID + "_" + localEntryUID;
+	}
+	
+	/**
+	 * 设置资源属性
+	 * @param jsonObj
+	 * @param assetinfo
+	 */
+	private void setAsset(JSONObject jsonObj, AssetTransition assetinfo) {
+
+		if (jsonObj.containsKey("ListOfMetaData")) {
+			
+			JSONObject attObj = jsonObj.getJSONObject("tagAttribute");
+			if(attObj.containsKey("productOfferingUID")){
+				assetinfo.setProductOfferingCode(attObj.getString("productOfferingUID"));
+				assetinfo.setKeyword(productName);
+			}
+			if(attObj.containsKey("price")){
+				assetinfo.setPrice((StringUtil.toDouble(attObj.getString("price"), 0.00)*100)+"");
+			}
+			if(attObj.containsKey("duration")){
+				assetinfo.setDisplayRunTime(attObj.getString("duration"));
+				assetinfo.setRunTime(attObj.getString("duration"));
+			}
+			if (attObj.containsKey("entryCount")) {
+				assetinfo.setEntryCount(attObj.getString("entryCount"));
+			}
+			
+			JSONArray metaArray = jsonObj.getJSONArray("ListOfMetaData");
+			int metaSize = metaArray.size();
+			for (int n = 0; n < metaSize; n++) {
+				JSONObject metaObj = metaArray.getJSONObject(n);
+				
+				if(metaObj.containsKey("Title")){
+					assetinfo.setAssetName(metaObj.getString("Title"));
+					assetinfo.setTitle(metaObj.getString("Title"));
+				}else if(metaObj.containsKey("Genre")){
+					assetinfo.setGenre(AssetDeal.getGenreName(metaObj.getString("Genre")));
+				}else if(metaObj.containsKey("YearOfRelease")){
+					assetinfo.setYear(metaObj.getString("YearOfRelease"));
+				}else if(metaObj.containsKey("Rating")){
+					assetinfo.setRating(metaObj.getString("Rating"));
+				}else if(metaObj.containsKey("Actors")){
+					assetinfo.setActor(metaObj.getString("Actors"));
+				}else if(metaObj.containsKey("Directors")){
+					assetinfo.setDirector(metaObj.getString("Directors"));
+				}else if(metaObj.containsKey("LongDescription")){
+					assetinfo.setAssetDesc(metaObj.getString("LongDescription"));
+				}else	if (metaObj.containsKey("PackageDescription")) {
+					assetinfo.setAssetDesc(metaObj.getString("PackageDescription"));
+				}else if(metaObj.containsKey("PosterBoard")){
+					String posterUrl = assetinfo.getPosterUrl() != null ? assetinfo.getPosterUrl()+";" : "";
+					assetinfo.setPosterUrl(posterUrl + metaObj.getString("PosterBoard"));
+				} else if (metaObj.containsKey("PackagePosterBoard")) {
+					String posterUrl = assetinfo.getPosterUrl() != null ? assetinfo.getPosterUrl() + ";" : "";
+					assetinfo.setPosterUrl(posterUrl + metaObj.getString("PackagePosterBoard"));
+				}else if(metaObj.containsKey("CreationDate")){
+					assetinfo.setCreateTime(Timestamp.valueOf(metaObj.getString("CreationDate")));
+				}else if(metaObj.containsKey("Category")){
+					assetinfo.setCategory(metaObj.getString("Category"));
+				}else if(metaObj.containsKey("ProviderId")){
+					assetinfo.setProviderId(metaObj.getString("ProviderId"));
+				}else if(metaObj.containsKey("ProviderAssetId")){
+					assetinfo.setProviderAssetId(metaObj.getString("ProviderAssetId"));
+//				}else if(metaObj.containsKey("Provider")){
+//					assetinfo.setProviderId(metaObj.getString("Provider"));
+//				}else if(metaObj.containsKey("OriginalProviderAssetId")){
+//					assetinfo.setProviderAssetId(metaObj.getString("OriginalProviderAssetId"));
+//				}else if(metaObj.containsKey("TitleAbbreviation")){
+//					assetinfo.setFirstSpell(metaObj.getString("TitleAbbreviation"));
+//				}else if(metaObj.containsKey("Length")){
+//				}else if(metaObj.containsKey("TitleSortName")){
+//				}else if(metaObj.containsKey("ActivateTime")){
+//				}else if(metaObj.containsKey("DeactivateTime")){
+//				}else if(metaObj.containsKey("CountryOfOrigin")){
+//				}else if(metaObj.containsKey("Distributor")){
+//				}else if(metaObj.containsKey("Product")){
+//				}else if(metaObj.containsKey("Studio")){
+//				}else if(metaObj.containsKey("Language")){
+//				}else if(metaObj.containsKey("AudioType")){
+//				}else if(metaObj.containsKey("SubtitleLanguage")){
+//				}else if(metaObj.containsKey("DubbedLanguage")){
+//				}else if(metaObj.containsKey("Producers")){
+//				}else if(metaObj.containsKey("Writers")){
+//				}else if(metaObj.containsKey("ProviderId")){
+//				}else if(metaObj.containsKey("ProviderAssetId")){
+//				}else if(metaObj.containsKey("RentalType")){
+//				}else if(metaObj.containsKey("RentalTime")){
+				}
+			}
+		}
+	}
+	
+	/**
+	 * 设置产品信息
+	 * @param attObj
+	 * @return
+	 */
+	private ProductOffering setProducOffering(JSONObject entryObj) {
+		ProductOffering product = new ProductOffering();
+		
+		JSONObject attObj = entryObj.getJSONObject("tagAttribute");
+		
+		product.setProductOfferingCode(attObj.getString("productOfferingID"));	
+		product.setProductOfferingName(attObj.getString("productOfferingName"));
+		
+		//  2014年10月10日15:27:06修改  by vernon
+		try{
+			product.setProductOfferingPrice(StringUtil.toDouble(attObj.getString("price"), 0.00)*100);
+		}
+		catch(JSONException e){
+			product.setProductOfferingPrice(StringUtil.toDouble(0.00, 0.00)*100);
+			System.out.println("price is not found!!!,this is JSONException in setProducOffering!!!");
+		}
+		//	  2014年10月10日15:27:06修改  by vernon
+		
+		
+		product.setRemark(attObj.getString("description"));
+		String chargeType = attObj.getString("productOfferingType");
+		product.setProductOfferingType(StringUtil.toInteger(chargeType, 0));
+		if (Constant.CHARGE_TYPE_BAOYUE_BO.equals(chargeType)) {
+			product.setChargeType(Constant.CHARGE_TYPE_BAOYUE);
+		} else if (Constant.CHARGE_TYPE_ANCI_BO.equals(chargeType)) {
+			product.setChargeType(Constant.CHARGE_TYPE_ANCI);
+		} else if (Constant.CHARGE_TYPE_MIANFEI_BO.equals(chargeType)) {
+			product.setChargeType(Constant.CHARGE_TYPE_MIANFEI);
+		} else {
+			product.setChargeType(Constant.CHARGE_TYPE_MIANFEI);
+		}
+		product.setEffectiveTime(attObj.getString("effectiveTime"));
+		product.setExpireTime(attObj.getString("expirationTime"));
+		product.setProductOfferingStatus(Constant.PO_STATUS_NORMAL);
+		product.setProductOfferingSummaryshort(attObj.getString("serviceTag"));
+
+		return product;
+	}
+	
+	/**
+	 * 解析下层数据
+	 * @param entryObj
+	 * @param url
+	 * @throws IOException
+	 */
+	private void parseSub(JSONObject entryObj,String url) throws IOException{
+		String parentHUID ="";
+		JSONObject attObj = entryObj.getJSONObject("tagAttribute");
+
+		parentHUID = attObj.getString("parentHUID");
+		String currentHUID = attObj.getString("hierarchyUID");
+		String jsonUrl = "";
+		jsonUrl = url.replaceAll(parentHUID,currentHUID);
+		parseVodJson(jsonUrl);
+//		log.append("\njson data ok****==》"+jsonUrl );
+
+	}
+	
+	/**
+	 * 资源路径
+	 */
+	private void setPath(String path){
+		if (path != null){
+			resourcePath += "/" + path;
+//			System.out.println(resourcePath);
+		}else if (resourcePath.lastIndexOf("/") != -1){
+			resourcePath = resourcePath.substring(0,resourcePath.lastIndexOf("/"));
+		}
+	}
+
+}

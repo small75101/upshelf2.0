@@ -1,0 +1,80 @@
+package com.avit.upshelf;
+
+import com.avit.getDate.BODateParse;
+import com.avit.upshelf.bean.AutoAction;
+import com.avit.util.InitConfig;
+
+public class AutoThread extends Thread {
+	
+	private String id;
+	private String bo_addr;
+	private String entry_url;
+	private String operationCode;
+	
+	DBConnect jdbc = null;
+	AutoAction auto = null;
+	boolean sleep;
+	public AutoThread(String id,boolean sleep){
+		this.id = id;
+		this.bo_addr = InitConfig.getConfigMap().get("bo_addr");
+		this.entry_url = InitConfig.getConfigMap().get("entry_url");
+		this.operationCode = InitConfig.getConfigMap().get("operation_code");
+		this.sleep = sleep;
+	}
+	public void run(){
+		BODateParse dateParse = new BODateParse();
+		UpshelfService upshelf = new UpshelfService();
+		UpshelfService.testlen=0;
+		while(true){
+
+			try {
+				jdbc = new DBConnect();
+				//0.获取AutoAction对象信息
+				auto = jdbc.getAutoActionById(id);
+				
+				//根据运营商过滤 
+				if (operationCode.equals(auto.getOperationCode())) {
+					
+					//1.数据同步 正同步数据
+					if (auto.getIsRsync() == 1) {
+						//当前进行的状态 0等待，1同步数据，2上架，3生成静态页面，xml，js；4发布
+						//update t_autoaction set state=? where  id=? and  operation_code=?
+						jdbc.updateAutoState(1, auto.getId(), null);
+						dateParse.init(jdbc.getLocalConnection());
+						String json_url = bo_addr + entry_url + auto.getTreeroot();
+						//同步BO数据并解析
+
+					//	dateParse.dataRsync(json_url, 0, auto.getPoid(), operationCode);
+
+						dateParse.dataRsync(json_url, 0 /*全量*/, auto.getPoid(), operationCode);
+
+						
+						//2.上架
+						if (auto.getIsUptree() == 1) { //将数据自动上架到Menuid(t_categoryinfo.id)指定的数结构下
+							jdbc.updateAutoState(2, auto.getId(), null);
+							upshelf.init(jdbc, operationCode);
+							upshelf.dataUpshelf(bo_addr+auto.getRsyncUrl(),auto.getMenuid());
+						}
+						jdbc.updateAutoState(0, auto.getId(), null);
+					}
+				}
+				jdbc.closeConnection();
+				jdbc = null;
+				//等待
+				if(sleep)
+					Thread.sleep(auto.getSleeptime());
+			} catch (Exception e) {
+				System.out.println("AutoThread exception : poid=" + auto.getPoid());
+				e.printStackTrace();
+			} finally {
+				if (jdbc!=null) {
+					jdbc.closeConnection();
+					jdbc = null;
+				}
+				if(!sleep)
+					break;
+			}
+
+		}
+	}
+}
